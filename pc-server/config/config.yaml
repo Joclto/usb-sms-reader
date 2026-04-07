@@ -1,0 +1,39 @@
+server:
+  listen_host: "0.0.0.0"
+  listen_port: 8080
+  workers: 4
+
+adb:
+  path: "./tools/adb"
+  device_timeout: 30
+
+infopush:
+  enabled: true
+  server_url: "http://localhost:8000"
+  push_token: "${INFOPUSH_PUSH_TOKEN}"
+  timeout: 10
+  retry_count: 3
+
+storage:
+  type: "sqlite"
+  path: "./data/sms.db"
+
+classifier:
+  enabled: true
+  rules:
+    验证码:
+      keywords: ["验证码", "code", "动态码", "校验码", "auth", "验证"]
+      patterns: ["\\d{4,6}"]
+    通知:
+      keywords: ["通知", "提醒", "成功", "失败", "已到账", "已发货"]
+      patterns: null
+    营销:
+      keywords: ["优惠", "促销", "折扣", "中奖", "免费", "红包"]
+      patterns: null
+    金融:
+      keywords: ["银行", "支付", "转账", "余额", "账单"]
+      patterns: null
+
+logging:
+  level: "info"
+  file: "./logs/app.log"

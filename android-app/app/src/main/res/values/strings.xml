@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SMS Reader</string>
+    <string name="accessibility_service_description">此服务用于监听新短信通知并将内容转发到PC服务端。不会收集或上传您的其他数据。</string>
+</resources>

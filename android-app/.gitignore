@@ -1,0 +1,14 @@
+gradle-wrapper.jar
+.gradle/
+build/
+local.properties
+.idea/
+.DS_Store
+*.iml
+*.apk
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/

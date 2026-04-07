@@ -1,0 +1,70 @@
+# Rust
+target/
+Cargo.lock
+*.pdb
+
+# Android
+android-app/.gradle/
+android-app/**/build/
+android-app/**/local.properties
+android-app/.idea/
+android-app/**/*.iml
+android-app/.externalNativeBuild/
+android-app/.cxx/
+android-app/captures/
+android-app/gradle/
+android-app/.local_history/
+
+# Android Studio
+*.iml
+.idea/
+*.iws
+*.ipr
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+*.out
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.keystore
+secrets/
+
+# Build artifacts
+*.apk
+*.aab
+*.ipa
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+*.sublime-project
+*.sublime-workspace
