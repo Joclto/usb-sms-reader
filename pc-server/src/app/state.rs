@@ -3,14 +3,45 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 static ADB_PATH: OnceLock<String> = OnceLock::new();
 
 pub fn set_adb_path(path: String) {
     let _ = ADB_PATH.set(path);
 }
 
-fn get_adb_path() -> &'static str {
-    ADB_PATH.get().map(|s| s.as_str()).unwrap_or("adb")
+fn get_adb_path() -> String {
+    if let Some(path) = ADB_PATH.get() {
+        if std::path::Path::new(path).exists() {
+            return path.clone();
+        }
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    
+    if let Some(ref dir) = exe_dir {
+        for candidate in ["tools/adb.exe", "tools/adb", "adb.exe", "adb"] {
+            let full = dir.join(candidate);
+            if full.exists() {
+                return full.to_string_lossy().to_string();
+            }
+        }
+    }
+    
+    ADB_PATH.get().cloned().unwrap_or_else(|| "adb".to_string())
+}
+
+fn adb_command() -> Command {
+    let mut cmd = Command::new(get_adb_path());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,8 +192,11 @@ impl AppState {
     }
 
     pub fn add_sms(&mut self, sms: SmsMessage) {
+        if self.sms_list.iter().any(|s| s.id == sms.id) {
+            return;
+        }
         self.sms_list.insert(0, sms);
-        if self.sms_list.len() > 100 {
+        if self.sms_list.len() > 500 {
             self.sms_list.pop();
         }
     }
@@ -172,7 +206,7 @@ pub type SharedState = Arc<Mutex<AppState>>;
 
 // ADB helper functions
 pub fn check_adb_available() -> bool {
-    Command::new(get_adb_path())
+    adb_command()
         .arg("version")
         .output()
         .map(|o| o.status.success())
@@ -180,7 +214,7 @@ pub fn check_adb_available() -> bool {
 }
 
 pub fn list_adb_devices() -> Vec<String> {
-    let output = Command::new(get_adb_path())
+    let output = adb_command()
         .args(["devices", "-l"])
         .output();
     
@@ -205,7 +239,7 @@ pub fn list_adb_devices() -> Vec<String> {
 }
 
 pub fn setup_adb_forward(port: u16) -> Result<(), String> {
-    let status = Command::new(get_adb_path())
+    let status = adb_command()
         .args(["reverse", &format!("tcp:{}", port), &format!("tcp:{}", port)])
         .status()
         .map_err(|e| format!("ADB reverse failed: {}", e))?;
@@ -218,7 +252,7 @@ pub fn setup_adb_forward(port: u16) -> Result<(), String> {
 }
 
 pub fn remove_adb_forward(port: u16) -> Result<(), String> {
-    let status = Command::new(get_adb_path())
+    let status = adb_command()
         .args(["reverse", "--remove", &format!("tcp:{}", port)])
         .status()
         .map_err(|e| format!("ADB remove reverse failed: {}", e))?;
@@ -231,7 +265,7 @@ pub fn remove_adb_forward(port: u16) -> Result<(), String> {
 }
 
 pub fn check_adb_forward_active(port: u16) -> bool {
-    let output = Command::new(get_adb_path())
+    let output = adb_command()
         .args(["reverse", "--list"])
         .output();
     

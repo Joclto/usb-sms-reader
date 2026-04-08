@@ -4,7 +4,7 @@ server:
   workers: 4
 
 adb:
-  path: "./tools/adb"
+  path: "./tools/adb.exe"
   device_timeout: 30
 
 infopush:

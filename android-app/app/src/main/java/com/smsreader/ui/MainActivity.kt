@@ -67,14 +67,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
         
+        LogManager.setListener { _ ->
+            runOnUiThread {
+                updateLogDisplay()
+            }
+        }
+        
         updateLogDisplay()
         LogManager.logInfo("应用启动")
         LogManager.log("当前版本: 1.0")
         
-        // 定期更新连接状态
         handler.postDelayed(object : Runnable {
             override fun run() {
                 updateConnectionStatus()
+                updateLogDisplay()
                 handler.postDelayed(this, 1000)
             }
         }, 1000)
@@ -172,7 +178,7 @@ class MainActivity : AppCompatActivity() {
     
     override fun onDestroy() {
         super.onDestroy()
-        LogManager.removeListener()
+        ConnectionState.setListener {}
         handler.removeCallbacksAndMessages(null)
     }
 

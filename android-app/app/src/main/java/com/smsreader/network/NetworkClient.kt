@@ -14,19 +14,28 @@ class NetworkClient(private val host: String, private val port: Int) {
     private var outputStream: OutputStream? = null
     private var reader: BufferedReader? = null
     private var commandListener: ((String) -> Unit)? = null
+    private var onDisconnected: (() -> Unit)? = null
+    @Volatile private var intentionallyDisconnecting = false
+    @Volatile private var listenerThreadAlive = false
 
     fun setCommandListener(listener: (String) -> Unit) {
         commandListener = listener
+    }
+    
+    fun setOnDisconnectedListener(listener: () -> Unit) {
+        onDisconnected = listener
     }
 
     suspend fun connect(): Boolean {
         return withContext(Dispatchers.IO) {
             try {
+                intentionallyDisconnecting = false
                 socket = Socket(host, port)
+                socket?.tcpNoDelay = true
+                socket?.soTimeout = 30000
                 outputStream = socket?.getOutputStream()
                 reader = BufferedReader(InputStreamReader(socket?.getInputStream()))
                 
-                // Start listening for commands
                 startCommandListener()
                 true
             } catch (e: Exception) {
@@ -37,14 +46,29 @@ class NetworkClient(private val host: String, private val port: Int) {
     }
 
     private fun startCommandListener() {
+        listenerThreadAlive = true
         Thread {
             try {
-                while (socket?.isConnected == true) {
-                    val line = reader?.readLine() ?: break
-                    commandListener?.invoke(line)
+                while (!intentionallyDisconnecting && socket?.isClosed == false) {
+                    try {
+                        val line = reader?.readLine()
+                        if (line == null) {
+                            break
+                        }
+                        commandListener?.invoke(line)
+                    } catch (_: java.net.SocketTimeoutException) {
+                        continue
+                    }
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                if (!intentionallyDisconnecting) {
+                    e.printStackTrace()
+                }
+            } finally {
+                listenerThreadAlive = false
+                if (!intentionallyDisconnecting) {
+                    onDisconnected?.invoke()
+                }
             }
         }.start()
     }
@@ -58,6 +82,7 @@ class NetworkClient(private val host: String, private val port: Int) {
                 true
             } catch (e: Exception) {
                 e.printStackTrace()
+                notifyDisconnected()
                 false
             }
         }
@@ -72,23 +97,29 @@ class NetworkClient(private val host: String, private val port: Int) {
                 true
             } catch (e: Exception) {
                 e.printStackTrace()
+                notifyDisconnected()
                 false
             }
         }
     }
 
-    suspend fun readLine(): String? {
+    suspend fun sendPing(): Boolean {
         return withContext(Dispatchers.IO) {
             try {
-                reader?.readLine()
+                val json = JSONObject().apply { put("type", "ping") }
+                outputStream?.write((json.toString() + "\n").toByteArray(Charsets.UTF_8))
+                outputStream?.flush()
+                true
             } catch (e: Exception) {
                 e.printStackTrace()
-                null
+                notifyDisconnected()
+                false
             }
         }
     }
 
     fun disconnect() {
+        intentionallyDisconnecting = true
         try {
             reader?.close()
             outputStream?.close()
@@ -102,6 +133,12 @@ class NetworkClient(private val host: String, private val port: Int) {
     }
 
     fun isConnected(): Boolean {
-        return socket?.isConnected == true && socket?.isClosed == false
+        return listenerThreadAlive && socket?.isConnected == true && socket?.isClosed == false
+    }
+    
+    private fun notifyDisconnected() {
+        if (!intentionallyDisconnecting) {
+            onDisconnected?.invoke()
+        }
     }
 }
