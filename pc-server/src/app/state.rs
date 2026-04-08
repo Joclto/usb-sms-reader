@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use std::process::Command;
@@ -10,6 +10,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static ADB_PATH: OnceLock<String> = OnceLock::new();
+pub const ANDROID_APP_PORT: u16 = 8080;
 
 pub fn set_adb_path(path: String) {
     let _ = ADB_PATH.set(path);
@@ -38,6 +39,13 @@ fn get_adb_path() -> String {
 }
 
 fn adb_command() -> Command {
+    let mut cmd = Command::new(get_adb_path());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+pub fn adb_command_from_path() -> Command {
     let mut cmd = Command::new(get_adb_path());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -128,6 +136,15 @@ impl Default for DeviceInfo {
     }
 }
 
+impl DeviceInfo {
+    pub fn display_name(&self) -> String {
+        match &self.model {
+            Some(m) => format!("{} ({})", m, self.serial),
+            None => format!("Device ({})", self.serial),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub timestamp: Instant,
@@ -141,6 +158,7 @@ pub struct AdbStatus {
     pub device_connected: bool,
     pub port_forwarded: bool,
     pub device_serial: Option<String>,
+    pub devices: Vec<DeviceInfo>,
     pub last_check: Option<Instant>,
 }
 
@@ -149,6 +167,8 @@ pub struct AppState {
     pub connection_status: ConnectionStatus,
     pub adb_status: AdbStatus,
     pub connected_device: Option<DeviceInfo>,
+    pub active_client_count: usize,
+    pub active_connections_by_device: HashMap<String, usize>,
     pub sms_list: Vec<SmsMessage>,
     pub logs: VecDeque<LogEntry>,
     pub server_running: bool,
@@ -166,6 +186,8 @@ impl Default for AppState {
             connection_status: ConnectionStatus::Disconnected,
             adb_status: AdbStatus::default(),
             connected_device: None,
+            active_client_count: 0,
+            active_connections_by_device: HashMap::new(),
             sms_list: Vec::new(),
             logs: VecDeque::with_capacity(1000),
             server_running: false,
@@ -213,11 +235,11 @@ pub fn check_adb_available() -> bool {
         .unwrap_or(false)
 }
 
-pub fn list_adb_devices() -> Vec<String> {
+pub fn list_adb_devices() -> Vec<DeviceInfo> {
     let output = adb_command()
         .args(["devices", "-l"])
         .output();
-    
+
     match output {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout);
@@ -227,7 +249,15 @@ pub fn list_adb_devices() -> Vec<String> {
                 .filter_map(|line| {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 && parts[1] == "device" {
-                        Some(parts[0].to_string())
+                        let serial = parts[0].to_string();
+                        let model = parts.iter().find_map(|p| {
+                            p.strip_prefix("model:").map(|m| m.to_string())
+                        });
+                        Some(DeviceInfo {
+                            serial,
+                            model,
+                            android_version: None,
+                        })
                     } else {
                         None
                     }
@@ -238,41 +268,62 @@ pub fn list_adb_devices() -> Vec<String> {
     }
 }
 
-pub fn setup_adb_forward(port: u16) -> Result<(), String> {
-    let status = adb_command()
-        .args(["reverse", &format!("tcp:{}", port), &format!("tcp:{}", port)])
-        .status()
-        .map_err(|e| format!("ADB reverse failed: {}", e))?;
-    
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ADB reverse command failed".to_string())
-    }
-}
-
-pub fn remove_adb_forward(port: u16) -> Result<(), String> {
-    let status = adb_command()
-        .args(["reverse", "--remove", &format!("tcp:{}", port)])
-        .status()
-        .map_err(|e| format!("ADB remove reverse failed: {}", e))?;
-    
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ADB remove reverse command failed".to_string())
-    }
-}
-
-pub fn check_adb_forward_active(port: u16) -> bool {
+pub fn setup_adb_forward(serial: &str, device_port: u16, host_port: u16) -> Result<(), String> {
     let output = adb_command()
-        .args(["reverse", "--list"])
+        .args([
+            "-s",
+            serial,
+            "reverse",
+            &format!("tcp:{}", device_port),
+            &format!("tcp:{}", host_port),
+        ])
+        .output()
+        .map_err(|e| format!("ADB reverse failed: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "unknown error".to_string()
+        };
+        Err(format!("ADB reverse command failed: {}", detail))
+    }
+}
+
+pub fn remove_adb_forward(serial: &str, device_port: u16) -> Result<(), String> {
+    let output = adb_command()
+        .args(["-s", serial, "reverse", "--remove", &format!("tcp:{}", device_port)])
+        .output()
+        .map_err(|e| format!("ADB remove reverse failed: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() { "unknown error".to_string() } else { stderr };
+        Err(format!("ADB remove reverse command failed: {}", detail))
+    }
+}
+
+pub fn check_adb_forward_active(serial: &str, device_port: u16, host_port: u16) -> bool {
+    let output = adb_command()
+        .args(["-s", serial, "reverse", "--list"])
         .output();
-    
+
     match output {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains(&format!("tcp:{}", port))
+            let device = format!("tcp:{}", device_port);
+            let host = format!("tcp:{}", host_port);
+            stdout
+                .lines()
+                .any(|line| line.contains(&device) && line.contains(&host))
         }
         Err(_) => false,
     }

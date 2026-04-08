@@ -1,16 +1,57 @@
 use eframe::egui;
+use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::process::Command;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
-use super::state::{AppState, ConnectionStatus, SmsMessage, check_adb_available, list_adb_devices, setup_adb_forward, remove_adb_forward, check_adb_forward_active, set_adb_path};
+use super::state::{AppState, ConnectionStatus, SmsMessage, ANDROID_APP_PORT, check_adb_available, list_adb_devices, setup_adb_forward, remove_adb_forward, check_adb_forward_active, set_adb_path, adb_command_from_path};
 use crate::config::Settings;
 use crate::forwarder::InfoPushClient;
+
+async fn bind_server_listener(
+    listen_host: &str,
+    preferred_port: u16,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<(TcpListener, u16), std::io::Error> {
+    match TcpListener::bind((listen_host, preferred_port)).await {
+        Ok(listener) => Ok((listener, preferred_port)),
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+            if let Ok(mut s) = state.lock() {
+                s.add_log(
+                    "WARN",
+                    format!(
+                        "Port {} is already in use. Switching PC listener to an available port and keeping Android side on {} via ADB reverse.",
+                        preferred_port, ANDROID_APP_PORT
+                    ),
+                );
+            }
+
+            let listener = TcpListener::bind((listen_host, 0)).await?;
+            let actual_port = listener.local_addr()?.port();
+            Ok((listener, actual_port))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn with_shared_state_mut<R>(
+    state: &Arc<Mutex<AppState>>,
+    f: impl FnOnce(&mut AppState) -> R,
+) -> Option<R> {
+    match state.lock() {
+        Ok(mut guard) => Some(f(&mut guard)),
+        Err(_) => None,
+    }
+}
+
+fn with_shared_state<R>(state: &Arc<Mutex<AppState>>, f: impl FnOnce(&AppState) -> R) -> Option<R> {
+    match state.lock() {
+        Ok(guard) => Some(f(&guard)),
+        Err(_) => None,
+    }
+}
 
 pub struct SmsReaderApp {
     state: Arc<Mutex<AppState>>,
@@ -20,9 +61,18 @@ pub struct SmsReaderApp {
     adb_check_timer: f64,
     auto_setup_adb: bool,
     command_sender: broadcast::Sender<String>,
+    device_switch_sender: broadcast::Sender<Option<String>>,
 }
 
 impl SmsReaderApp {
+    fn with_state_mut<R>(&self, f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
+        with_shared_state_mut(&self.state, f)
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&AppState) -> R) -> Option<R> {
+        with_shared_state(&self.state, f)
+    }
+
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let state = Arc::new(Mutex::new(AppState::default()));
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
@@ -35,20 +85,22 @@ impl SmsReaderApp {
 
         // Check ADB availability on startup
         {
-            let mut s = state.lock().unwrap();
-            s.adb_status.adb_available = check_adb_available();
-            if let Some(ref settings) = settings {
-                s.server_port = settings.server.listen_port;
-                s.infopush_enabled = settings.infopush.enabled;
-            }
-            if s.adb_status.adb_available {
-                s.add_log("INFO", "ADB found, checking for devices...".into());
-            } else {
-                s.add_log("WARN", "ADB not found. Ensure Android SDK platform-tools is in PATH.".into());
-            }
+            let _ = with_shared_state_mut(&state, |s| {
+                s.adb_status.adb_available = check_adb_available();
+                if let Some(ref settings) = settings {
+                    s.server_port = settings.server.listen_port;
+                    s.infopush_enabled = settings.infopush.enabled;
+                }
+                if s.adb_status.adb_available {
+                    s.add_log("INFO", "ADB found, checking for devices...".into());
+                } else {
+                    s.add_log("WARN", "ADB not found. Ensure Android SDK platform-tools is in PATH.".into());
+                }
+            });
         }
 
         let (tx, _) = broadcast::channel::<String>(16);
+        let (device_switch_tx, _) = broadcast::channel::<Option<String>>(16);
 
         let app = SmsReaderApp {
             state,
@@ -58,61 +110,88 @@ impl SmsReaderApp {
             adb_check_timer: 0.0,
             auto_setup_adb: true,
             command_sender: tx.clone(),
+            device_switch_sender: device_switch_tx,
         };
 
-        app.start_server(tx.subscribe());
+        app.start_server();
         app
     }
 
-    fn start_server(&self, _command_rx: broadcast::Receiver<String>) {
+fn start_server(&self) {
         let state = Arc::clone(&self.state);
         let settings = self.settings.clone();
-        let port = self.state.lock().unwrap().server_port;
+        let port = self.with_state(|s| s.server_port).unwrap_or(8080);
         let cmd_sender = self.command_sender.clone();
+        let switch_sender = self.device_switch_sender.clone();
 
-        {
-            let mut s = self.state.lock().unwrap();
+        let _ = self.with_state_mut(|s| {
             s.server_running = true;
             s.add_log("INFO", format!("Server starting on port {}...", port));
-        }
+        });
 
         self.runtime.spawn(async move {
+            let listen_host = settings
+                .as_ref()
+                .map(|s| s.server.listen_host.clone())
+                .unwrap_or_else(|| "0.0.0.0".to_string());
             let listen_port = settings.as_ref().map(|s| s.server.listen_port).unwrap_or(8080);
-
-            let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", listen_port)).await {
-                Ok(l) => l,
+            let (listener, actual_port) = match bind_server_listener(&listen_host, listen_port, &state).await {
+                Ok(result) => result,
                 Err(e) => {
                     if let Ok(mut s) = state.lock() {
-                        s.add_log("ERROR", format!("Bind failed: {}", e));
                         s.server_running = false;
+                        s.connection_status = ConnectionStatus::Error(format!("Server bind failed: {}", e));
+                        s.add_log(
+                            "ERROR",
+                            format!("Failed to start TCP server on {}:{}: {}", listen_host, listen_port, e),
+                        );
                     }
                     return;
                 }
             };
 
             if let Ok(mut s) = state.lock() {
-                s.add_log("INFO", format!("Server listening on port {}", listen_port));
+                s.server_port = actual_port;
+                if actual_port == listen_port {
+                    s.add_log("INFO", format!("Server listening on {}:{}", listen_host, actual_port));
+                } else {
+                    s.add_log(
+                        "INFO",
+                        format!(
+                            "Server listening on {}:{} (configured {} was busy; Android still uses {} through ADB reverse)",
+                            listen_host, actual_port, listen_port, ANDROID_APP_PORT
+                        ),
+                    );
+                }
             }
 
             loop {
                 let accept_result = listener.accept().await;
                 match accept_result {
                     Ok((stream, addr)) => {
-                        if let Ok(mut s) = state.lock() {
+                        let selected_serial_at_connect =
+                            with_shared_state(&state, |s| s.adb_status.device_serial.clone()).flatten();
+                        let selected_serial_key = selected_serial_at_connect.clone();
+                        let _ = with_shared_state_mut(&state, |s| {
+                            s.active_client_count += 1;
+                            if let Some(ref serial) = selected_serial_key {
+                                *s.active_connections_by_device.entry(serial.clone()).or_insert(0) += 1;
+                            }
                             s.add_log("INFO", format!("Client connected: {}", addr));
-                            s.connection_status = ConnectionStatus::Connected;
                             s.connected_device = Some(super::state::DeviceInfo {
-                                serial: addr.to_string(),
+                                serial: selected_serial_key.clone().unwrap_or_else(|| addr.to_string()),
                                 model: Some("Android Device".into()),
                                 android_version: None,
                             });
-                        }
+                            SmsReaderApp::apply_connection_status(s);
+                        });
 
                         let state_clone = Arc::clone(&state);
                         let (rd, mut wr) = stream.into_split();
                         let reader = tokio::io::BufReader::new(rd);
                         let mut lines = reader.lines();
                         let mut cmd_rx = cmd_sender.subscribe();
+                        let mut switch_rx = switch_sender.subscribe();
 
                         // Spawn task for handling connection
                         tokio::spawn(async move {
@@ -246,14 +325,46 @@ impl SmsReaderApp {
                                             Err(_) => {}
                                         }
                                     }
+                                    result = switch_rx.recv() => {
+                                        match result {
+                                            Ok(new_selected_serial) => {
+                                                if new_selected_serial != selected_serial_at_connect {
+                                                    let _ = with_shared_state_mut(&state_clone, |s| {
+                                                        s.add_log(
+                                                            "INFO",
+                                                            "Selected device changed, closing stale client connection".into(),
+                                                        );
+                                                    });
+                                                    break;
+                                                }
+                                            }
+                                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                            Err(broadcast::error::RecvError::Closed) => break,
+                                        }
+                                    }
                                 }
                             }
 
-                            if let Ok(mut s) = state_clone.lock() {
-                                s.connection_status = ConnectionStatus::WaitingForDevice;
-                                s.connected_device = None;
-                                s.add_log("INFO", "Client disconnected".into());
-                            }
+                            let _ = with_shared_state_mut(&state_clone, |s| {
+                                s.active_client_count = s.active_client_count.saturating_sub(1);
+                                if let Some(ref serial) = selected_serial_key {
+                                    if let Some(count) = s.active_connections_by_device.get_mut(serial) {
+                                        *count = count.saturating_sub(1);
+                                        if *count == 0 {
+                                            s.active_connections_by_device.remove(serial);
+                                        }
+                                    }
+                                }
+                                let active_connections = s.active_client_count;
+                                SmsReaderApp::apply_connection_status(s);
+                                s.add_log(
+                                    "INFO",
+                                    format!(
+                                        "Client disconnected (active connections: {})",
+                                        active_connections
+                                    ),
+                                );
+                            });
                         });
                     }
                     Err(e) => {
@@ -266,113 +377,241 @@ impl SmsReaderApp {
         });
     }
 
+    fn apply_connection_status(state: &mut AppState) {
+        let selected_serial = state.adb_status.device_serial.clone();
+        let selected_connected = selected_serial
+            .as_ref()
+            .and_then(|s| state.active_connections_by_device.get(s))
+            .copied()
+            .unwrap_or(0)
+            > 0;
+
+        if selected_connected {
+            state.connection_status = ConnectionStatus::Connected;
+            if state.connected_device.is_none() {
+                state.connected_device = selected_serial.map(|serial| super::state::DeviceInfo {
+                    serial,
+                    model: Some("Android Device".into()),
+                    android_version: None,
+                });
+            }
+            return;
+        }
+
+        state.connected_device = None;
+        if !state.adb_status.adb_available {
+            state.connection_status = ConnectionStatus::Error("ADB not available".into());
+        } else if state.adb_status.devices.is_empty() || state.adb_status.device_serial.is_none() {
+            state.connection_status = ConnectionStatus::WaitingForDevice;
+        }
+    }
+
     fn check_and_setup_adb(&mut self) {
-        let port = self.state.lock().unwrap().server_port;
+        let host_port = self.with_state(|s| s.server_port).unwrap_or(8080);
         let state = Arc::clone(&self.state);
-        let settings = self.settings.clone();
         let auto_setup = self.auto_setup_adb;
+        let switch_sender = self.device_switch_sender.clone();
 
         self.runtime.spawn_blocking(move || {
             let adb_ok = check_adb_available();
             let devices = if adb_ok { list_adb_devices() } else { Vec::new() };
-            let forward_active = if adb_ok && !devices.is_empty() {
-                check_adb_forward_active(port)
-            } else {
-                false
-            };
 
-            {
-                let mut s = state.lock().unwrap();
-                let prev_device = s.adb_status.device_connected;
-                let prev_forward = s.adb_status.port_forwarded;
+            let (effective_serial, prev_serial, need_setup) = with_shared_state_mut(&state, |s| {
+                let prev_serial = s.adb_status.device_serial.clone();
+                let prev_forwarded = s.adb_status.port_forwarded;
 
+                s.adb_status.devices = devices;
                 s.adb_status.adb_available = adb_ok;
-                s.adb_status.device_connected = !devices.is_empty();
-                s.adb_status.port_forwarded = forward_active;
-                s.adb_status.device_serial = devices.first().cloned();
                 s.adb_status.last_check = Some(std::time::Instant::now());
 
-                if !prev_device && s.adb_status.device_connected {
-                    if let Some(ref serial) = &s.adb_status.device_serial {
-                        let serial = serial.clone();
-                        s.add_log("INFO", format!("Device connected: {}", serial));
+                if s.adb_status.devices.len() == 1 {
+                    s.adb_status.device_serial = Some(s.adb_status.devices[0].serial.clone());
+                } else if let Some(ref sel) = s.adb_status.device_serial {
+                    if !s.adb_status.devices.iter().any(|d| d.serial == *sel) {
+                        s.adb_status.device_serial = None;
+                        s.adb_status.port_forwarded = false;
+                        s.add_log("WARN", "Selected device disconnected".into());
                     }
                 }
-                if prev_device && !s.adb_status.device_connected {
-                    s.add_log("WARN", "Device disconnected".into());
+
+                s.adb_status.device_connected = s.adb_status.device_serial.is_some();
+                let effective_serial = s.adb_status.device_serial.clone();
+
+                if prev_serial.is_none() && effective_serial.is_some() {
+                    let serial_log = effective_serial.clone().unwrap_or_default();
+                    s.add_log("INFO", format!("Device connected: {}", serial_log));
                 }
-                if !prev_forward && s.adb_status.port_forwarded {
-                    s.add_log("INFO", format!("ADB reverse {} active", port));
+                if prev_serial.as_ref() != effective_serial.as_ref() {
+                    if let Some(ref cur) = effective_serial {
+                        let cur_name = s
+                            .adb_status
+                            .devices
+                            .iter()
+                            .find(|d| d.serial == *cur)
+                            .map(|d| d.display_name())
+                            .unwrap_or_else(|| cur.clone());
+                        s.add_log("INFO", format!("Device switched to: {}", cur_name));
+                    }
+                }
+
+                let need_setup = !prev_forwarded && effective_serial.is_some();
+                (effective_serial, prev_serial, need_setup)
+            })
+            .unwrap_or((None, None, false));
+
+            if prev_serial.as_ref() != effective_serial.as_ref() {
+                let _ = switch_sender.send(effective_serial.clone());
+            }
+
+            // Handle device switch: remove old device's forward
+            if let Some(ref prev) = prev_serial {
+                if let Some(ref cur) = effective_serial {
+                    if prev != cur {
+                        let _ = remove_adb_forward(prev, ANDROID_APP_PORT);
+                    }
                 }
             }
 
-            if auto_setup && adb_ok && !devices.is_empty() && !forward_active {
-                {
-                    let mut s = state.lock().unwrap();
-                    s.connection_status = ConnectionStatus::AdbForwarding;
-                    s.add_log("INFO", format!("Setting up ADB reverse for port {}...", port));
-                }
+            // Only attempt forward setup when needed
+            if need_setup && auto_setup && adb_ok {
+                if let Some(ref serial) = effective_serial {
+                    // First check if forward is already active (e.g. from previous session)
+                    let forward_active = check_adb_forward_active(serial, ANDROID_APP_PORT, host_port);
 
-                match setup_adb_forward(port) {
-                    Ok(()) => {
-                        let mut s = state.lock().unwrap();
-                        s.adb_status.port_forwarded = true;
-                        s.add_log("INFO", "ADB reverse set up successfully".into());
-                        s.connection_status = ConnectionStatus::WaitingForDevice;
-                    }
-                    Err(e) => {
-                        let mut s = state.lock().unwrap();
-                        s.add_log("ERROR", format!("Failed to setup ADB reverse: {}", e));
-                        s.connection_status = ConnectionStatus::Error(format!("ADB reverse failed: {}", e));
+                    if forward_active {
+                        let _ = with_shared_state_mut(&state, |s| {
+                            s.adb_status.port_forwarded = true;
+                            s.add_log(
+                                "INFO",
+                                format!("ADB reverse active: Android {} -> PC {}", ANDROID_APP_PORT, host_port),
+                            );
+                            SmsReaderApp::apply_connection_status(s);
+                        });
+                    } else {
+                        let _ = with_shared_state_mut(&state, |s| {
+                            s.connection_status = ConnectionStatus::AdbForwarding;
+                            s.add_log(
+                                "INFO",
+                                format!(
+                                    "Setting up ADB reverse for device {}: Android {} -> PC {}...",
+                                    serial, ANDROID_APP_PORT, host_port
+                                ),
+                            );
+                        });
+
+                        match setup_adb_forward(serial, ANDROID_APP_PORT, host_port) {
+                            Ok(()) => {
+                                let _ = with_shared_state_mut(&state, |s| {
+                                    s.adb_status.port_forwarded = true;
+                                    s.add_log(
+                                        "INFO",
+                                        format!("ADB reverse set up successfully: Android {} -> PC {}", ANDROID_APP_PORT, host_port),
+                                    );
+                                    SmsReaderApp::apply_connection_status(s);
+                                });
+                            }
+                            Err(e) => {
+                                let _ = with_shared_state_mut(&state, |s| {
+                                    s.adb_status.port_forwarded = false;
+                                    s.add_log("ERROR", format!("Failed to setup ADB reverse: {}", e));
+                                    s.connection_status = ConnectionStatus::Error(format!("ADB reverse failed: {}", e));
+                                });
+                            }
+                        }
                     }
                 }
             }
 
-            {
-                let mut s = state.lock().unwrap();
-                if !s.adb_status.adb_available {
-                    if !matches!(s.connection_status, ConnectionStatus::Connected) {
-                        s.connection_status = ConnectionStatus::Error("ADB not available".into());
-                    }
-                } else if devices.is_empty() {
-                    if !matches!(s.connection_status, ConnectionStatus::Connected) {
-                        s.connection_status = ConnectionStatus::WaitingForDevice;
-                    }
-                }
-            }
+            let _ = with_shared_state_mut(&state, |s| {
+                SmsReaderApp::apply_connection_status(s);
+            });
         });
     }
 
     fn reconnect_adb(&mut self) {
-        let port = self.state.lock().unwrap().server_port;
-        let adb_path = self.settings.as_ref().map(|s| s.adb.path.clone()).unwrap_or_else(|| "./tools/adb".to_string());
-
-        {
-            let mut s = self.state.lock().unwrap();
+        let host_port = self.with_state(|s| s.server_port).unwrap_or(8080);
+        let serial = self.with_state(|s| s.adb_status.device_serial.clone()).flatten();
+        let switch_sender = self.device_switch_sender.clone();
+        let _ = self.with_state_mut(|s| {
             s.add_log("INFO", "Reconnecting ADB...".into());
-        }
+        });
 
-        // Remove existing forward first
-        let _ = remove_adb_forward(port);
-        
-        // Kill and restart ADB server
-        {
-            let mut cmd = Command::new(&adb_path);
-            #[cfg(target_os = "windows")]
-            cmd.creation_flags(0x08000000);
-            let _ = cmd.args(["kill-server"]).status();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        {
-            let mut cmd = Command::new(&adb_path);
-            #[cfg(target_os = "windows")]
-            cmd.creation_flags(0x08000000);
-            let _ = cmd.args(["start-server"]).status();
-        }
-        
-        // Recheck
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        self.check_and_setup_adb();
+        let state = Arc::clone(&self.state);
+        self.runtime.spawn_blocking(move || {
+            if let Some(ref s) = serial {
+                let _ = remove_adb_forward(s, ANDROID_APP_PORT);
+            }
+
+            {
+                let mut cmd = adb_command_from_path();
+                let _ = cmd.args(["kill-server"]).status();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            {
+                let mut cmd = adb_command_from_path();
+                let _ = cmd.args(["start-server"]).status();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            let adb_ok = check_adb_available();
+            let devices = if adb_ok { list_adb_devices() } else { Vec::new() };
+            let selected_serial = with_shared_state(&state, |s| s.adb_status.device_serial.clone()).flatten();
+            let effective_serial = if devices.len() == 1 {
+                Some(devices[0].serial.clone())
+            } else if let Some(ref sel) = selected_serial {
+                if devices.iter().any(|d| d.serial == *sel) {
+                    Some(sel.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let _ = with_shared_state_mut(&state, |s| {
+                s.adb_status.adb_available = adb_ok;
+                s.adb_status.devices = devices;
+                s.adb_status.device_connected = effective_serial.is_some();
+                s.adb_status.device_serial = effective_serial.clone();
+                s.adb_status.last_check = Some(std::time::Instant::now());
+            });
+            let _ = switch_sender.send(effective_serial.clone());
+
+            if let Some(ref serial) = effective_serial {
+                let _ = with_shared_state_mut(&state, |s| {
+                    s.connection_status = ConnectionStatus::AdbForwarding;
+                    s.add_log(
+                        "INFO",
+                        format!(
+                            "Setting up ADB reverse for device {}: Android {} -> PC {}...",
+                            serial, ANDROID_APP_PORT, host_port
+                        ),
+                    );
+                });
+                match setup_adb_forward(serial, ANDROID_APP_PORT, host_port) {
+                    Ok(()) => {
+                        let _ = with_shared_state_mut(&state, |s| {
+                            s.adb_status.port_forwarded = true;
+                            s.add_log(
+                                "INFO",
+                                format!("ADB reverse set up successfully: Android {} -> PC {}", ANDROID_APP_PORT, host_port),
+                            );
+                            SmsReaderApp::apply_connection_status(s);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = with_shared_state_mut(&state, |s| {
+                            s.add_log("ERROR", format!("Failed to setup ADB reverse: {}", e));
+                            s.connection_status = ConnectionStatus::Error(format!("ADB reverse failed: {}", e));
+                        });
+                    }
+                }
+            } else {
+                let _ = with_shared_state_mut(&state, |s| {
+                    SmsReaderApp::apply_connection_status(s);
+                });
+            }
+        });
     }
 
     fn send_command(&self, command: &str) {
@@ -383,14 +622,15 @@ impl SmsReaderApp {
     }
 
     fn fetch_sms(&self, limit: i32) {
-        {
-            let s = self.state.lock().unwrap();
-            if !matches!(s.connection_status, ConnectionStatus::Connected) {
-                let status = format!("{:?}", s.connection_status);
-                drop(s);
-                self.state.lock().unwrap().add_log("ERROR", format!("Cannot send: not connected ({})", status));
+        if let Some(status) = self.with_state(|s| s.connection_status.clone()) {
+            if !matches!(status, ConnectionStatus::Connected) {
+                let _ = self.with_state_mut(|s| {
+                    s.add_log("ERROR", format!("Cannot send: not connected ({:?})", status));
+                });
                 return;
             }
+        } else {
+            return;
         }
         let cmd = if limit > 0 {
             format!(r#"{{"type":"fetch_all_sms","limit":{}}}"#, limit)
@@ -398,7 +638,9 @@ impl SmsReaderApp {
             r#"{"type":"fetch_all_sms","limit":0}"#.to_string()
         };
         let label = if limit > 0 { format!("Fetch SMS (latest {})", limit) } else { "Fetch All SMS".to_string() };
-        self.state.lock().unwrap().add_log("INFO", format!("User requested: {}", label));
+        let _ = self.with_state_mut(|s| {
+            s.add_log("INFO", format!("User requested: {}", label));
+        });
         self.send_command(&cmd);
     }
 }
@@ -420,16 +662,17 @@ impl eframe::App for SmsReaderApp {
                 ui.separator();
 
                 // Get status from state
-                let (adb_status, device_status, forward_status, connection_status, device_serial) = {
-                    let s = self.state.lock().unwrap();
-                    (
-                        s.adb_status.adb_available,
-                        s.adb_status.device_connected,
-                        s.adb_status.port_forwarded,
-                        s.connection_status.clone(),
-                        s.adb_status.device_serial.clone(),
-                    )
-                };
+                let (adb_status, forward_status, connection_status, devices, selected_serial) = self
+                    .with_state(|s| {
+                        (
+                            s.adb_status.adb_available,
+                            s.adb_status.port_forwarded,
+                            s.connection_status.clone(),
+                            s.adb_status.devices.clone(),
+                            s.adb_status.device_serial.clone(),
+                        )
+                    })
+                    .unwrap_or((false, false, ConnectionStatus::Disconnected, Vec::new(), None));
 
                 // ADB Available indicator
                 let (adb_text, adb_color) = if adb_status {
@@ -441,18 +684,61 @@ impl eframe::App for SmsReaderApp {
 
                 ui.separator();
 
-                // Device Status
-                let (device_text, device_color) = if device_status {
+                // Device selection ComboBox
+                let device_connected = selected_serial.is_some();
+                let (device_text, device_color) = if devices.is_empty() {
+                    ("No device", egui::Color32::YELLOW)
+                } else if device_connected {
                     ("Device: Connected", egui::Color32::GREEN)
                 } else {
-                    ("Device: Not Connected", egui::Color32::YELLOW)
+                    ("Select device", egui::Color32::YELLOW)
                 };
                 ui.colored_label(device_color, device_text);
 
-                // Device serial
-                if let Some(serial) = device_serial {
-                    ui.label(format!("({})", serial));
-                }
+                let selected_text = if let Some(ref serial) = selected_serial {
+                    devices.iter().find(|d| d.serial == *serial)
+                        .map(|d| d.display_name())
+                        .unwrap_or_else(|| serial.clone())
+                } else {
+                    "-- select --".to_string()
+                };
+
+                egui::ComboBox::from_id_salt("adb_device_select")
+                    .selected_text(&selected_text)
+                    .show_ui(ui, |ui| {
+                        for device in &devices {
+                            let label = device.display_name();
+                            let is_selected = selected_serial.as_ref() == Some(&device.serial);
+                            if ui.selectable_label(is_selected, &label).clicked() {
+                                let changed = self
+                                    .with_state(|s| s.adb_status.device_serial.as_ref() != Some(&device.serial))
+                                    .unwrap_or(false);
+                                if changed {
+                                    let old_serial = self
+                                        .with_state_mut(|s| {
+                                            let old_serial = s.adb_status.device_serial.clone();
+                                            s.adb_status.device_serial = Some(device.serial.clone());
+                                            s.adb_status.port_forwarded = false;
+                                            s.connection_status = ConnectionStatus::WaitingForDevice;
+                                            s.connected_device = None;
+                                            s.sms_list.clear();
+                                            s.sim_cards.clear();
+                                            s.selected_sim = None;
+                                            s.add_log("INFO", format!("Selected device: {}", device.serial));
+                                            SmsReaderApp::apply_connection_status(s);
+                                            old_serial
+                                        })
+                                        .flatten();
+                                    self.selected_sms = None;
+                                    if let Some(ref old) = old_serial {
+                                        let _ = remove_adb_forward(old, ANDROID_APP_PORT);
+                                    }
+                                    let _ = self.device_switch_sender.send(Some(device.serial.clone()));
+                                    self.adb_check_timer = 5.0;
+                                }
+                            }
+                        }
+                    });
 
                 ui.separator();
 
@@ -518,13 +804,18 @@ impl eframe::App for SmsReaderApp {
             .default_width(400.0)
             .show(ctx, |ui| {
                 let sms_display: Vec<(i64, String, String, String)> = {
-                    let s = self.state.lock().unwrap();
-                    s.sms_list.iter().map(|sms| {
-                        let time_str = chrono::DateTime::from_timestamp_millis(sms.timestamp)
-                            .map(|t| t.format("%m-%d %H:%M").to_string())
-                            .unwrap_or_default();
-                        (sms.id, sms.sender.clone(), sms.body.chars().take(50).collect(), time_str)
-                    }).collect()
+                    self.with_state(|s| {
+                        s.sms_list
+                            .iter()
+                            .map(|sms| {
+                                let time_str = chrono::DateTime::from_timestamp_millis(sms.timestamp)
+                                    .map(|t| t.format("%m-%d %H:%M").to_string())
+                                    .unwrap_or_default();
+                                (sms.id, sms.sender.clone(), sms.body.chars().take(50).collect(), time_str)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
                 };
                 
                 ui.heading(format!("SMS List ({})", sms_display.len()));
@@ -552,7 +843,7 @@ impl eframe::App for SmsReaderApp {
         // SMS detail panel
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(selected_id) = self.selected_sms {
-                let sms_list = self.state.lock().unwrap().sms_list.clone();
+                let sms_list = self.with_state(|s| s.sms_list.clone()).unwrap_or_default();
                 if let Some(sms) = sms_list.iter().find(|s| s.id == selected_id) {
                     ui.heading(&sms.sender);
                     let time_str = chrono::DateTime::from_timestamp_millis(sms.timestamp)
@@ -604,7 +895,9 @@ impl eframe::App for SmsReaderApp {
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let logs: Vec<_> = self.state.lock().unwrap().logs.iter().rev().take(100).cloned().collect();
+                    let logs: Vec<_> = self
+                        .with_state(|s| s.logs.iter().rev().take(100).cloned().collect())
+                        .unwrap_or_default();
                     for log in logs {
                         let color = match log.level.as_str() {
                             "ERROR" => egui::Color32::RED,
